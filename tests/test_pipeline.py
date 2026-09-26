@@ -1,7 +1,7 @@
 """Tests for the end-to-end audio processing and transcription pipeline."""
 
-from pathlib import Path
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -12,9 +12,9 @@ import soundfile as sf
 import torch
 import torchaudio
 
+from backend.services.asr import transcribe_audio
 from backend.services.audio_processing import preprocess_audio
 from backend.services.vad import extract_speech_chunks
-from backend.services.asr import transcribe_audio
 from tests.helpers import create_temp_wav_file
 
 

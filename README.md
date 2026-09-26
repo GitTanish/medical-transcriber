@@ -1,6 +1,6 @@
 # Medical Transcriber & Clinical Summarizer
 
-An end-to-end, real-time medical transcription and clinical information extraction system engineered for ambient doctor-patient consultations. The application captures audio directly from the browser microphone in deterministic 3.5-second chunks, cleans the signal through high-pass filtering and stationary noise reduction, segments speech with Silero VAD, transcribes audio using Whisper, and incrementally streams the dialogue to a live transcript view. Upon consultation completion, the consolidated transcript is processed by a clinical LLM governed by zero-hallucination guardrails, producing a validated, strongly-typed Pydantic medical record rendered across 11 structured clinical UI sections.
+An end-to-end, real-time medical transcription and clinical information extraction system engineered for ambient doctor-patient consultations. The application captures audio directly from the browser microphone in deterministic 7-second chunks, cleans the signal through high-pass filtering and stationary noise reduction, segments speech with Silero VAD, transcribes audio using Whisper, and incrementally streams the dialogue to a live transcript view. Upon consultation completion, the consolidated transcript is processed by a clinical LLM governed by zero-hallucination guardrails, producing a validated, strongly-typed Pydantic medical record rendered across 11 structured clinical UI sections.
 
 The architecture enforces a strict decoupling between **Audio Processing → ASR → Transcript State → Clinical Analysis → Schema Validation → UI Presentation**.
 
@@ -12,7 +12,7 @@ The architecture enforces a strict decoupling between **Audio Processing → ASR
 
 - **Layered Architecture**: Clear separation of concerns across presentation (`frontend/`), API transport (`backend/api/`), domain services (`backend/services/`), and typed data schemas (`backend/schemas/`).
 - **In-Memory Audio Processing**: Audio buffers are resampled, filtered, and segmented entirely in-memory using PyTorch and SoundFile, eliminating temporary file I/O overhead and disk-wear bottlenecks.
-- **Deterministic Browser-Side Chunking**: Uses the Web Audio API to capture 16 kHz mono PCM frames in 3.5-second sliding buffers, providing predictable streaming cadence without blocking the browser thread.
+- **Deterministic Browser-Side Chunking**: Uses the Web Audio API to capture 16 kHz mono PCM frames in 7-second sliding buffers (`chunkDurationMs`), providing predictable streaming cadence without blocking the browser thread.
 - **Two-Stage Audio Preprocessing**: Implements an 80 Hz 6th-order Butterworth high-pass filter to remove mechanical and HVAC rumble alongside calibrated stationary noise reduction before speech detection.
 - **Deep-Learning Voice Activity Detection (VAD)**: Employs Silero VAD v5 to isolate human speech segments and filter out silence, preventing empty audio chunks from consuming downstream ASR compute.
 - **Incremental Transcription Streaming**: Transcribes incoming chunks iteratively so dialogue appears progressively during the consultation rather than delaying all feedback until recording concludes.
@@ -31,7 +31,7 @@ The system coordinates two independent pipelines: an **Incremental Transcription
 flowchart TD
     subgraph Browser ["Client-Side (Browser)"]
         A[Microphone Audio] --> B[Web Audio API: 16kHz PCM Mono]
-        B --> C[In-Memory WAV Encoder: 3.5s Chunks]
+        B --> C[In-Memory WAV Encoder: 7s Chunks]
         K[Incremental Transcript Display]
         Q[Structured Clinical UI: 11 Sections]
     end
@@ -63,13 +63,13 @@ flowchart TD
 # Engineering Decisions
 
 ### Why Chunked Audio Processing?
-Transcribing audio in short browser-side chunks (3.5 seconds) enables progressive transcript streaming. Clinicians receive immediate visual feedback during consultations instead of waiting for a single large audio file to upload and process at the conclusion of an encounter.
+Transcribing audio in short browser-side chunks (7 seconds) enables progressive transcript streaming. Clinicians receive immediate visual feedback during consultations instead of waiting for a single large audio file to upload and process at the conclusion of an encounter. The cadence is deliberately 7 seconds rather than shorter: every chunk triggers a full decode → preprocess → VAD → ASR round-trip and uploads are serialised through a single client-side promise chain, so a tighter interval would double the request rate and let the queue outpace the provider round-trip on slower connections.
 
 ### Why VAD Before ASR?
 Ambient medical environments contain natural pauses, deep breaths, and clinician thinking time. Running Silero VAD before calling Whisper drops non-speech silence, drastically reducing API payload sizes, avoiding transcription hallucinations on low-energy background audio, and reducing latency.
 
 ### Why Preprocess Before VAD and ASR?
-Sub-vocal room hum, air conditioning vibrations, and microphone contact noise typically live below 80 Hz. Applying an 80 Hz high-pass Butterworth filter strips this low-frequency energy before it reaches the VAD model. Moderate spectral noise reduction (`prop_decrease=0.75`) further cleans ambient room noise while strictly preserving high-frequency speech consonants (*s, t, p, k*) that differentiate critical medical terms.
+Sub-vocal room hum, air conditioning vibrations, and microphone contact noise typically live below 80 Hz. Applying an 80 Hz high-pass Butterworth filter strips this low-frequency energy before it reaches the VAD model. Moderate spectral noise reduction (`prop_decrease` driven by `NOISE_REDUCTION_STRENGTH`, default `0.5`) further cleans ambient room noise while strictly preserving high-frequency speech consonants (*s, t, p, k*) that differentiate critical medical terms.
 
 ### Why Separate ASR from Clinical Analysis?
 Speech-to-text and clinical entity extraction solve fundamentally distinct engineering problems. Keeping them in separate services adheres to the Single Responsibility Principle, allowing independent testing, isolated scaling, and model swapping (e.g., swapping Whisper models or switching LLM providers) without coupling speech mechanics to extraction logic.
@@ -91,12 +91,12 @@ Isolating DSP (`audio_processing.py`), speech detection (`vad.py`), transcriptio
 1. User starts recording in the web client.
 2. Web Audio API captures microphone input via a ScriptProcessorNode at 16 kHz.
 3. Audio frames are buffered and converted into 16-bit PCM WAV blobs in client memory.
-4. Chunks are dispatched every 3.5 seconds to POST /api/transcribe/.
+4. Chunks are dispatched every 7 seconds to POST /api/transcribe/, carrying the transcript of previous chunks as `context`.
 5. Backend decodes bytes using SoundFile and downmixes multi-channel audio to mono.
 6. Audio preprocessing executes high-pass filtering (80 Hz) and stationary noise reduction.
-7. Silero VAD detects speech timestamps, discarding silent or sub-250ms fragments.
+7. Silero VAD detects speech timestamps, discarding silence and segments shorter than VAD_MIN_SEGMENT_SECONDS (0.18 s by default).
 8. Active speech segments are converted in-memory to WAV byte buffers.
-9. Groq Whisper (whisper-large-v3-turbo) transcribes each segment.
+9. Groq Whisper (whisper-large-v3-turbo) transcribes each segment, using the accumulated transcript as a context prompt capped at ASR_PROMPT_MAX_CHARS characters.
 10. Backend returns structured JSON containing segment timestamps and transcript text.
 11. Frontend incrementally appends new segments and refreshes word and chunk statistics.
 12. User clicks Stop Mic; client awaits in-flight uploads and flushes trailing audio buffers.
@@ -138,14 +138,15 @@ The clinical extraction pipeline structures the transcript into a typed `Clinica
 
 ### `POST /api/transcribe/`
 - **Purpose**: Ingests audio chunks, runs preprocessing and VAD, and returns timestamped speech transcriptions.
-- **Request**: `multipart/form-data` (`file`: audio binary [WAV/MP3/OGG/FLAC], `language`: optional string, default `"en"`)
+- **Request**: `multipart/form-data` (`file`: audio binary [WAV/MP3/OGG/FLAC], `language`: optional ISO code or `auto` — default `auto`, `context`: optional rolling transcript of earlier chunks, trimmed server-side to `ASR_PROMPT_MAX_CHARS` before it reaches the provider)
 - **Response**: `application/json` (`TranscriptionResponse`)
+- **Validation**: `400` invalid audio, `413` oversized upload, `422` invalid language, `503` provider unavailable.
   ```json
   {
     "text": "Doctor hello Rahul good to see you what brings you in today",
     "filename": "chunk.wav",
     "language": "en",
-    "duration": 3.5,
+    "duration": 7.0,
     "segments": [{ "id": 0, "start": 0.32, "end": 3.18, "text": "Doctor hello Rahul good to see you what brings you in today" }]
   }
   ```
@@ -154,6 +155,7 @@ The clinical extraction pipeline structures the transcript into a typed `Clinica
 - **Purpose**: Analyzes consultation text and extracts validated clinical entities.
 - **Request**: `application/json` (`ClinicalAnalysisRequest`: `{"transcript": "Doctor: Hello Rahul... Patient: I have had fever..."}`)
 - **Response**: `application/json` (`ClinicalAnalysisResponse` adhering to the `ClinicalNote` schema)
+- **Validation**: `422` blank or oversized transcript, `503` provider unavailable.
 
 ### `GET /`
 - **Purpose**: Serves the single-page application frontend from `frontend/index.html`.
@@ -197,7 +199,7 @@ medical-transcriber/
 ├── Img/
 │   └── image.png                  # Application UI reference capture
 ├── .env.example                   # Environment configuration template
-├── requirements.txt               # Pinned project dependencies
+├── requirements.txt               # Project dependencies
 └── README.md                      # Engineering documentation
 ```
 
@@ -208,13 +210,13 @@ medical-transcriber/
 The test suite covers signal processing, voice detection, speech recognition, API endpoints, and extraction guardrails:
 
 - **Audio & Signal Processing**: `tests/test_vad.py` validates the 80 Hz Butterworth high-pass filter by measuring RMS and peak signal delta; `tests/test_pipeline.py` executes audio decoding, 16 kHz resampling, DSP filtering, Silero VAD segmentation, and segment transcription end-to-end.
-- **Speech-to-Text (ASR)**: `tests/test_asr.py` validates in-memory audio byte streaming directly against the Groq Whisper service.
+- **Speech-to-Text (ASR)**: `tests/test_asr.py` validates in-memory audio byte streaming and provider request construction with a mocked Groq client.
 - **API Integration**: `tests/test_api_transcribe.py` tests `POST /api/transcribe/` multipart payload handling, file decoding, segment extraction, and JSON response formatting; `tests/test_api_analyze.py` tests `POST /api/analyze/` with doctor-patient dialogue, verifying extraction of demographics, symptoms, and diagnoses.
 - **Clinical Extraction & Guardrails**: `tests/test_extraction_guardrails.py` executes guardrail testing on deliberately underspecified transcripts (omitting demographics, medications, vitals, and diagnoses), asserting that the clinical LLM leaves unmentioned fields `null` or empty without hallucinating unstated data; `tests/test_clinical.py` validates schema deserialization.
 
 ### Running the Test Suite
 ```powershell
-# Run the complete test suite
+# Run the complete test suite (provider calls are mocked)
 pytest tests/
 
 # Run individual component and pipeline tests
@@ -251,14 +253,18 @@ Copy-Item .env.example .env
 Update `.env` with your Groq API credentials:
 ```ini
 GROQ_API_KEY=your_groq_api_key_here
-APP_HOST=0.0.0.0
+APP_HOST=127.0.0.1
 APP_PORT=8000
+CORS_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
+MAX_AUDIO_BYTES=26214400
+MAX_AUDIO_DURATION_SECONDS=600
+MAX_TRANSCRIPT_CHARS=100000
 ```
 
 ### 4. Start the Application Server
 Run Uvicorn from the workspace root:
 ```powershell
-uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
+uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
 ```
 
 ### 5. Access the Web Application
@@ -273,10 +279,39 @@ http://localhost:8000/
 
 | Variable | Required | Default | Description |
 | :--- | :---: | :---: | :--- |
-| `GROQ_API_KEY` | Yes | — | Authentication key for Groq Whisper ASR and Qwen clinical models |
-| `OPENAI_API_KEY`| No | — | Optional backup LLM API key |
-| `APP_HOST` | No | `0.0.0.0` | Binding host address for FastAPI |
+| `GROQ_API_KEY` | Yes for AI features | — | Authentication key for Groq Whisper ASR and Qwen clinical models |
+| `APP_HOST` | No | `127.0.0.1` | Binding host address for FastAPI |
 | `APP_PORT` | No | `8000` | Binding port for FastAPI |
+| `CORS_ORIGINS` | No | Localhost origins | Comma-separated browser origins allowed to call the API |
+| `ASR_MODEL` | No | `whisper-large-v3-turbo` | Groq speech-to-text model |
+| `LLM_MODEL` | No | `qwen/qwen3.8-27b` | Groq clinical extraction model |
+| `PROVIDER_TIMEOUT_SECONDS` | No | `30` | Maximum time allowed for each provider request |
+| `ASR_CONTEXT_CHARS` | No | `1200` | Characters of rolling transcript context the API accepts per request |
+| `ASR_PROMPT_MAX_CHARS` | No | `800` | Hard cap on the context sent as the Whisper `prompt` (provider allows ~224 tokens; see note below) |
+| `VAD_THRESHOLD` | No | `0.35` | Silero speech probability threshold |
+| `VAD_MIN_SPEECH_DURATION_MS` | No | `150` | Minimum speech region length Silero will report |
+| `VAD_MIN_SILENCE_DURATION_MS` | No | `250` | Minimum silence required to close a speech region |
+| `VAD_SPEECH_PAD_MS` | No | `180` | Padding added around detected speech |
+| `VAD_MIN_SEGMENT_SECONDS` | No | `0.18` | Segments shorter than this are dropped before ASR |
+| `NOISE_REDUCTION_STRENGTH` | No | `0.5` | Noise-reduction aggressiveness (0–1), applied as `prop_decrease = 1.0 - strength` |
+| `MAX_AUDIO_BYTES` | No | `26214400` | Maximum uploaded audio payload size in bytes |
+| `MAX_INPUT_SAMPLE_RATE` | No | `192000` | Highest input sample rate accepted before resampling |
+| `MAX_AUDIO_DURATION_SECONDS` | No | `600` | Maximum duration accepted by the transcription endpoint |
+| `MAX_LANGUAGE_CHARS` | No | `16` | Maximum accepted length of the `language` form field |
+| `MAX_TRANSCRIPT_CHARS` | No | `100000` | Maximum transcript length sent to clinical analysis |
+
+> **Why `ASR_PROMPT_MAX_CHARS` exists**: Groq Whisper accepts at most 224 tokens in the `prompt` field, and tokens are roughly 4–5 characters for clinical English. Sending more fails the entire request with a 400, which would silently drop a chunk of the consultation, so the effective prompt budget is `min(ASR_CONTEXT_CHARS, ASR_PROMPT_MAX_CHARS)` and the trim snaps to a word boundary.
+
+---
+
+# Operational Safeguards
+
+- The UI requires explicit consent before sending microphone audio or a transcript to the configured AI provider.
+- Uploads and transcripts are bounded, decoded defensively, and provider failures return `503` instead of silently becoming empty clinical data.
+- The rolling transcript sent to the ASR provider as a `prompt` is clamped to a documented token-safe budget (`ASR_PROMPT_MAX_CHARS`) at a word boundary, so long consultations cannot overflow the provider's context window and fail mid-recording.
+- The default server bind is loopback-only and CORS uses an explicit localhost allowlist. Put authentication, TLS, rate limiting, and a reverse proxy in front of any shared deployment.
+- Clinical fields are rendered as data only; unknown patient details remain `Not specified`/`N/A` and are never filled with demo values.
+- API responses include no-store and basic security response headers; avoid logging transcripts or raw provider errors in production.
 
 ---
 
@@ -287,7 +322,7 @@ http://localhost:8000/
 | **Microphone Audio Capture** | Web Audio API capturing 16 kHz PCM audio with canvas waveform visualization ([frontend/js/audio.js](frontend/js/audio.js)) |
 | **Voice Activity Detection (VAD)** | Silero VAD v5 deep-learning speech segmentation and timestamped chunking ([backend/services/vad.py](backend/services/vad.py)) |
 | **Speech-to-Text (ASR) / Whisper** | Groq-hosted `whisper-large-v3-turbo` with in-memory WAV byte streaming ([backend/services/asr.py](backend/services/asr.py)) |
-| **Live Transcript Display** | Periodic 3.5s chunk uploads, word/chunk counters, and interim ghost text ([frontend/js/app.js](frontend/js/app.js)) |
+| **Live Transcript Display** | Periodic 7s chunk uploads, word/chunk counters, and interim ghost text ([frontend/js/app.js](frontend/js/app.js)) |
 | **Full Transcript to LLM on Completion** | Automated single LLM request triggered upon recording stop via `onRecordingComplete` ([frontend/js/app.js](frontend/js/app.js)) |
 | **Structured Medical Information Extraction** | Strongly-typed Pydantic `ClinicalNote` schema with strict zero-hallucination guardrails ([backend/schemas/clinical.py](backend/schemas/clinical.py), [backend/services/llm.py](backend/services/llm.py)) |
 | **Clinical Summary** | Synthesized medical record narrative generated alongside structured entities ([backend/schemas/clinical.py](backend/schemas/clinical.py)) |

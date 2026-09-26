@@ -1,23 +1,23 @@
 """Tests for Clinical schemas and analysis service."""
 
 import asyncio
-from pathlib import Path
+import json
 import sys
+from pathlib import Path
+from unittest.mock import patch
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-import pytest
 from backend.schemas.clinical import (
-    ClinicalAnalysisRequest,
-    ClinicalAnalysisResponse,
     ClinicalNote,
     Medication,
     PatientDetails,
     Symptoms,
 )
-from backend.services.llm import analyze_clinical_transcript
+from backend.services.llm import _clean_json_payload, analyze_clinical_transcript
+from tests.helpers import make_llm_completion
 
 
 def test_clinical_note_schema_instantiation():
@@ -54,24 +54,52 @@ def test_empty_transcript_handling():
     assert response.plan == []
 
 
+LLM_RESPONSE = {
+    "patient_details": {
+        "name": "Rahul",
+        "age": 30,
+        "sex": "Male",
+        "identifiers": [],
+    },
+    "chief_complaint": "Persistent cough and mild fever",
+    "history_of_present_illness": "Cough and fever have persisted for three days.",
+    "symptoms": {
+        "positive": ["cough", "fever"],
+        "negative": ["chest pain", "shortness of breath"],
+    },
+    "allergies": [],
+    "past_medical_history": [],
+    "medication_history": [{"name": "amoxicillin", "dosage": "500mg", "adherence": None}],
+    "clinical_observations": [],
+    "assessment": ["Acute bronchitis"],
+    "plan": ["Follow up in one week"],
+    "clinical_summary": "Thirty-year-old male with three days of cough and fever.",
+}
+
+
 def test_analyze_clinical_transcript():
-    """Verify analyze_clinical_transcript extracts structured clinical fields adhering to ClinicalNote schema."""
     sample_text = (
         "Patient Rahul, 30-year-old male, complains of persistent cough and mild fever for 3 days. "
         "He denies chest pain or shortness of breath. "
         "Doctor's provisional assessment is acute bronchitis. "
         "Plan is to take amoxicillin 500mg and follow up in one week."
     )
-    response = asyncio.run(analyze_clinical_transcript(sample_text))
+    with patch(
+        "backend.services.llm.client.chat.completions.create",
+        return_value=make_llm_completion(json.dumps(LLM_RESPONSE)),
+    ):
+        response = asyncio.run(analyze_clinical_transcript(sample_text))
 
-    # Validate against actual ClinicalNote / ClinicalAnalysisResponse schema fields
     assert isinstance(response, ClinicalNote)
-    assert response.chief_complaint is not None or response.clinical_summary is not None
-    assert isinstance(response.assessment, list)
-    assert isinstance(response.plan, list)
-    assert isinstance(response.symptoms.positive, list)
-    assert isinstance(response.symptoms.negative, list)
-    assert isinstance(response.medication_history, list)
+    assert response.chief_complaint is not None
+    assert response.assessment == ["Acute bronchitis"]
+    assert response.symptoms.negative == ["chest pain", "shortness of breath"]
+    assert response.medication_history[0].name == "amoxicillin"
+
+
+def test_clean_json_payload_handles_fenced_and_wrapped_output():
+    payload = _clean_json_payload("prefix\n```json\n{\"clinical_summary\": \"ok\"}\n```\nsuffix")
+    assert json.loads(payload) == {"clinical_summary": "ok"}
 
 
 if __name__ == "__main__":

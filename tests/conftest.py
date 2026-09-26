@@ -1,7 +1,7 @@
 """Pytest configuration and shared fixtures."""
 
-from pathlib import Path
 import sys
+from pathlib import Path
 
 # Ensure repository root is on sys.path
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -10,6 +10,7 @@ if str(ROOT_DIR) not in sys.path:
 
 import pytest
 import torch
+
 from tests.helpers import (
     create_temp_wav_file,
     create_test_wav_bytes,

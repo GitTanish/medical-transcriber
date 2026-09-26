@@ -1,5 +1,6 @@
 from typing import Annotated
-from pydantic import BaseModel, ConfigDict, Field
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class PatientDetails(BaseModel):
@@ -62,12 +63,27 @@ class Medication(BaseModel):
 
 
 class ClinicalNote(BaseModel):
-    model_config = ConfigDict(populate_by_name=True, extra="ignore")
+    model_config = ConfigDict(
+        populate_by_name=True,
+        extra="ignore",
+        str_strip_whitespace=True,
+    )
 
     patient_details: Annotated[
         PatientDetails,
         Field(default_factory=PatientDetails, description="Patient details and identifiers")
     ] = Field(default_factory=PatientDetails)
+
+    language: str | None = Field(
+        default=None,
+        max_length=16,
+        description="Primary language of the source transcript when identifiable.",
+    )
+    script: str | None = Field(
+        default=None,
+        max_length=32,
+        description="Primary script used by the source transcript when identifiable.",
+    )
 
     chief_complaint: Annotated[
         str | None,
@@ -147,23 +163,33 @@ class ClinicalNote(BaseModel):
 class ClinicalAnalysisRequest(BaseModel):
     transcript: Annotated[
         str,
-        Field(description="Full consultation transcript to analyze.")
+        Field(
+            min_length=1,
+            max_length=100_000,
+            description="Full consultation transcript to analyze.",
+        )
     ]
+    language: str | None = Field(
+        default=None,
+        max_length=16,
+        description="Optional detected transcript language code.",
+    )
+
+    @field_validator("transcript")
+    @classmethod
+    def validate_transcript(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("transcript must contain non-whitespace content")
+        return value.strip()
+
+    @field_validator("language")
+    @classmethod
+    def validate_language(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip().lower()
+        return value or None
 
 
 class ClinicalAnalysisResponse(ClinicalNote):
     """Clinical analysis response matching the structured ClinicalNote model."""
-    pass
-
-
-class SOAPNote(BaseModel):
-    subjective: str = ""
-    objective: str = ""
-    assessment: str = ""
-    plan: str = ""
-
-
-class ClinicalEntity(BaseModel):
-    name: str
-    category: str
-    confidence: float = 1.0

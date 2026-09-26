@@ -15,6 +15,9 @@ const btnCopyToPrescription = document.getElementById('btnCopyToPrescription');
 const btnLoadDemo = document.getElementById('btnLoadDemo');
 const btnToggleSimulateMic = document.getElementById('btnToggleSimulateMic');
 const micModeLabel = document.getElementById('micModeLabel');
+const consentDataProcessing = document.getElementById('consentDataProcessing');
+const languageSelect = document.getElementById('languageSelect');
+const detectedLanguageLabel = document.getElementById('detectedLanguageLabel');
 
 const recordingBadge = document.getElementById('recordingBadge');
 const wordCountEl = document.getElementById('wordCount');
@@ -57,44 +60,86 @@ const apiBase = window.location.origin.startsWith("http") ? window.location.orig
 // State Variables
 let audioChunksCount = 0;
 let fullTranscriptText = "";
+let analysisPromise = null;
+let analysisAbortController = null;
+let analysisTranscript = "";
+let toastTimer = null;
+let isRecording = false;
+let transcriptLanguage = "auto";
+
+function requireDataConsent() {
+  if (!consentDataProcessing?.checked) {
+    showToast("Confirm AI data processing consent before starting or analyzing audio");
+    return false;
+  }
+  return true;
+}
 
 // Initialize Audio & Speech Manager
 const audioManager = new AudioTranscriptionManager({
   waveformCanvas,
   apiBase,
+  language: languageSelect?.value || "auto",
   onTranscriptChunk: (chunk) => appendTranscriptChunk(chunk),
+  onLanguageDetected: (language) => {
+    if (!language || language === "auto") return;
+    transcriptLanguage = language;
+    if (detectedLanguageLabel) detectedLanguageLabel.textContent = `Detected: ${language.toUpperCase()}`;
+    document.documentElement.lang = language;
+  },
   onInterimSpeech: (text) => {
     if (interimTranscript) interimTranscript.textContent = text;
   },
   onStatusChange: (status) => {
     if (vadStatusOverlay) vadStatusOverlay.textContent = status;
   },
-  onStateChange: (isRecording) => {
-    if (isRecording) {
-      btnStartMic.disabled = true;
-      btnStartMic.classList.add('opacity-60', 'cursor-not-allowed');
-      btnStopMic.disabled = false;
-      btnStopMic.classList.remove('opacity-60', 'cursor-not-allowed');
-      recordingBadge.classList.remove('hidden');
-      recordingBadge.classList.add('inline-flex');
-    } else {
-      btnStartMic.disabled = false;
-      btnStartMic.classList.remove('opacity-60', 'cursor-not-allowed');
-      btnStopMic.disabled = true;
-      btnStopMic.classList.add('opacity-60', 'cursor-not-allowed');
-      recordingBadge.classList.add('hidden');
-      recordingBadge.classList.remove('inline-flex');
+  onStateChange: (recording) => {
+    isRecording = recording;
+    if (recording) {
+      transcriptLanguage = languageSelect?.value || "auto";
+      if (detectedLanguageLabel) detectedLanguageLabel.textContent = "Detected: —";
+      document.documentElement.lang = transcriptLanguage === "auto" ? "en" : transcriptLanguage;
     }
+    btnStartMic.disabled = recording;
+    btnStartMic.classList.toggle('opacity-60', recording);
+    btnStartMic.classList.toggle('cursor-not-allowed', recording);
+    btnStopMic.disabled = !recording;
+    btnStopMic.classList.toggle('opacity-60', !recording);
+    btnStopMic.classList.toggle('cursor-not-allowed', !recording);
+    btnClearTranscript.disabled = recording;
+    btnSaveTranscript.disabled = recording;
+    btnLoadDemo.disabled = recording;
+    btnProcessAI.disabled = recording || Boolean(analysisPromise);
+    btnToggleSimulateMic.disabled = recording;
+    if (languageSelect) languageSelect.disabled = recording;
+    recordingBadge.classList.toggle('hidden', !recording);
+    recordingBadge.classList.toggle('inline-flex', recording);
   },
   onToast: (msg) => showToast(msg),
   onRecordingComplete: () => {
-    // Session completed: Automatically trigger LLM analysis if transcript text exists
     if (fullTranscriptText.trim().length > 0) {
       showToast("Recording stopped. Analyzing consultation transcript...");
-      processTranscriptWithAI();
+      void processTranscriptWithAI();
     }
   }
 });
+
+function cancelAnalysis() {
+  const wasRunning = Boolean(analysisPromise);
+  if (analysisAbortController) {
+    analysisAbortController.abort();
+    analysisAbortController = null;
+  }
+  analysisPromise = null;
+  analysisTranscript = "";
+  if (wasRunning) {
+    btnProcessAI.disabled = isRecording;
+    btnProcessAI.classList.remove('opacity-75');
+    document.getElementById('aiButtonText').textContent = "Process Transcript with AI";
+    document.getElementById('aiButtonIcon').classList.remove('animate-spin');
+    document.getElementById('aiButtonIcon').innerHTML = `<path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />`;
+  }
+}
 
 // Transcript management
 function appendTranscriptChunk(chunkText) {
@@ -117,6 +162,11 @@ function updateTranscriptDisplay() {
 }
 
 function clearTranscript() {
+  if (isRecording) {
+    showToast("Stop recording before clearing the transcript");
+    return;
+  }
+  cancelAnalysis();
   fullTranscriptText = "";
   audioChunksCount = 0;
   wordCountEl.textContent = "0";
@@ -133,63 +183,96 @@ function clearTranscript() {
   showToast("Transcript reset");
 }
 
-// Single Clinical Analysis Request on Session Completion
 async function processTranscriptWithAI() {
+  if (!requireDataConsent()) return;
   const transcript = fullTranscriptText.trim();
   if (!transcript) {
     showToast("Please record speech or load sample dialogue before processing!");
     return;
   }
+  if (isRecording) {
+    showToast("Stop recording before processing the transcript");
+    return;
+  }
+  if (analysisPromise) {
+    showToast("Clinical analysis is already in progress");
+    return;
+  }
 
-  const aiBtn = document.getElementById('btnProcessAI');
+  const aiBtn = btnProcessAI;
   const aiBtnText = document.getElementById('aiButtonText');
   const aiBtnIcon = document.getElementById('aiButtonIcon');
+  const controller = new AbortController();
+  analysisAbortController = controller;
+  analysisTranscript = transcript;
+  analysisPromise = (async () => {
+    aiBtn.disabled = true;
+    aiBtn.classList.add('opacity-75');
+    aiBtnText.textContent = "Extracting Clinical Entities...";
+    aiBtnIcon.innerHTML = `<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>`;
+    aiBtnIcon.classList.add('animate-spin');
 
-  aiBtn.disabled = true;
-  aiBtn.classList.add('opacity-75');
-  aiBtnText.textContent = "Extracting Clinical Entities...";
-  aiBtnIcon.innerHTML = `<path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>`;
-  aiBtnIcon.classList.add('animate-spin');
+    try {
+      const response = await fetch(`${apiBase}/api/analyze/`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          transcript,
+          language: transcriptLanguage === "auto" ? null : transcriptLanguage
+        }),
+        signal: controller.signal
+      });
+      if (!response.ok) {
+        let detail = `HTTP ${response.status}`;
+        try {
+          const payload = await response.json();
+          if (typeof payload?.detail === "string") detail = payload.detail;
+        } catch (error) {
+          void error;
+        }
+        throw new Error(detail);
+      }
 
-  try {
-    const response = await fetch(`${apiBase}/api/analyze/`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ transcript })
-    });
-
-    if (!response.ok) {
-      throw new Error(`Server returned HTTP ${response.status}`);
+      const note = await response.json();
+      if (analysisTranscript === transcript && fullTranscriptText.trim() === transcript) {
+        populateMedicalSummary(note);
+        showToast("Clinical summary extracted successfully");
+      }
+    } catch (error) {
+      if (error.name !== "AbortError") {
+        console.error("Clinical analysis error:", error);
+        showToast(`Analysis failed: ${error.message}`);
+      }
+    } finally {
+      if (analysisAbortController === controller) {
+        analysisAbortController = null;
+        analysisPromise = null;
+        analysisTranscript = "";
+        aiBtn.disabled = isRecording;
+        aiBtn.classList.remove('opacity-75');
+        aiBtnText.textContent = "Process Transcript with AI";
+        aiBtnIcon.classList.remove('animate-spin');
+        aiBtnIcon.innerHTML = `<path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />`;
+      }
     }
+  })();
 
-    const note = await response.json();
-    populateMedicalSummary(note);
-    showToast("Clinical summary extracted successfully");
-
-  } catch (err) {
-    console.error("Clinical analysis error:", err);
-    showToast(`Analysis failed: ${err.message}`);
-  } finally {
-    aiBtn.disabled = false;
-    aiBtn.classList.remove('opacity-75');
-    aiBtnText.textContent = "Process Transcript with AI";
-    aiBtnIcon.classList.remove('animate-spin');
-    aiBtnIcon.innerHTML = `<path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />`;
-  }
+  await analysisPromise;
 }
 
 // Helper to render lists as visual badges
 function renderBadgeList(container, items, colorClass = "bg-slate-50 text-slate-700 border-slate-200", emptyText = "None documented") {
   if (!container) return;
-  if (!items || items.length === 0) {
+  const values = Array.isArray(items) ? items.filter(Boolean) : [];
+  if (values.length === 0) {
     container.className = "text-center py-2 text-xs text-slate-400 min-h-[30px] flex items-center justify-center";
     container.textContent = emptyText;
     return;
   }
   container.className = "flex flex-wrap gap-1.5 py-1";
-  container.innerHTML = items
+  container.innerHTML = values
     .map(
       (item) => `
       <span class="inline-flex items-center text-xs px-2.5 py-1 rounded-md border font-medium ${colorClass}">
@@ -217,15 +300,14 @@ function populateMedicalSummary(data) {
   // 1. Patient Demographics Header
   if (data.patient_details) {
     const p = data.patient_details;
-    if (p.name) {
-      patientNameDisplay.textContent = `Patient Name: ${p.name}`;
-      inputPatientName.value = p.name;
-    }
-    const ageText = p.age !== null && p.age !== undefined ? p.age : "N/A";
-    const sexText = p.sex || "N/A";
-    patientMetaDisplay.innerHTML = `Age: ${ageText} &nbsp; Gender: ${sexText}`;
-    if (p.age !== null && p.age !== undefined) inputPatientAge.value = p.age;
-    if (p.sex) inputPatientGender.value = p.sex;
+    const name = typeof p.name === "string" && p.name.trim() ? p.name.trim() : "Not specified";
+    patientNameDisplay.textContent = `Patient Name: ${name}`;
+    inputPatientName.value = name === "Not specified" ? "" : name;
+    const ageText = p.age !== null && p.age !== undefined ? String(p.age) : "N/A";
+    const sexText = typeof p.sex === "string" && p.sex.trim() ? p.sex.trim() : "N/A";
+    patientMetaDisplay.textContent = `Age: ${ageText}  Gender: ${sexText}`;
+    inputPatientAge.value = p.age !== null && p.age !== undefined ? String(p.age) : "";
+    inputPatientGender.value = ["Male", "Female", "Other"].includes(sexText) ? sexText : "";
   }
 
   // 2. Structured Clinical Summary
@@ -256,8 +338,8 @@ function populateMedicalSummary(data) {
   }
 
   // 5. Symptoms (Positive and Negative / Denied)
-  const posSymptoms = data.symptoms?.positive || [];
-  const negSymptoms = data.symptoms?.negative || [];
+  const posSymptoms = Array.isArray(data.symptoms?.positive) ? data.symptoms.positive : [];
+  const negSymptoms = Array.isArray(data.symptoms?.negative) ? data.symptoms.negative : [];
   if (posSymptoms.length === 0 && negSymptoms.length === 0) {
     sectionSymptoms.className = "text-center py-2 text-xs text-slate-400 min-h-[30px] flex items-center justify-center";
     sectionSymptoms.textContent = "No symptoms recorded";
@@ -290,7 +372,7 @@ function populateMedicalSummary(data) {
   );
 
   // 7. Medications with Dosage & Adherence
-  const meds = data.medication_history || [];
+  const meds = Array.isArray(data.medication_history) ? data.medication_history : [];
   if (meds.length === 0) {
     sectionMedications.className = "text-center py-2 text-xs text-slate-400 min-h-[30px] flex items-center justify-center";
     sectionMedications.textContent = "No medications reported";
@@ -348,7 +430,13 @@ function populateMedicalSummary(data) {
 }
 
 function clearMedicalSummary() {
+  cancelAnalysis();
   sectionClinicalSummary.value = "";
+  patientNameDisplay.textContent = "Patient Name: Not specified";
+  patientMetaDisplay.textContent = "Age: N/A  Gender: N/A";
+  inputPatientName.value = "";
+  inputPatientAge.value = "";
+  inputPatientGender.value = "";
 
   const resetPlaceholders = [
     { el: sectionChiefComplaints, text: "No complaints extracted yet" },
@@ -372,17 +460,18 @@ function clearMedicalSummary() {
   showToast("Summary fields cleared");
 }
 
-function copyToPrescription() {
-  const patientName = inputPatientName.value || "Dr Tushar";
-  const patientAge = inputPatientAge.value || "30";
-  const patientGender = inputPatientGender.value || "Male";
-  const summaryVal = sectionClinicalSummary.value || "N/A";
+async function copyToPrescription() {
+  const patientName = inputPatientName.value.trim() || "Not specified";
+  const patientAge = inputPatientAge.value.trim() || "Not specified";
+  const patientGender = inputPatientGender.value || "Not specified";
+  const summaryVal = sectionClinicalSummary.value.trim() || "Not documented";
 
   function extractText(node) {
-    return node ? node.innerText.trim() : "";
+    return node && node.innerText.trim() ? node.innerText.trim() : "Not documented";
   }
 
   const prescriptionText = `================ CLINICAL PRESCRIPTION & ENCOUNTER NOTE ================
+*** AI-GENERATED DRAFT — CLINICIAN REVIEW REQUIRED ***
 Patient: ${patientName} | Age: ${patientAge} | Gender: ${patientGender}
 Date: ${new Date().toLocaleDateString('en-US', {
     year: 'numeric',
@@ -424,21 +513,25 @@ ${extractText(sectionPastHistory)}
 ${extractText(sectionFollowUp)}
 ========================================================================`;
 
-  const textarea = document.createElement('textarea');
-  textarea.value = prescriptionText;
-  textarea.setAttribute('readonly', '');
-  textarea.style.position = 'absolute';
-  textarea.style.left = '-9999px';
-  document.body.appendChild(textarea);
-  textarea.select();
-
   try {
-    document.execCommand('copy');
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(prescriptionText);
+    } else {
+      const textarea = document.createElement("textarea");
+      textarea.value = prescriptionText;
+      textarea.setAttribute("readonly", "");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand("copy");
+      textarea.remove();
+      if (!copied) throw new Error("Clipboard unavailable");
+    }
     showToast("Encounter copied to prescription clipboard!");
-  } catch (err) {
+  } catch (error) {
     showToast("Clipboard copy failed");
   }
-  document.body.removeChild(textarea);
 }
 
 function saveRecordingTranscript() {
@@ -460,33 +553,48 @@ function saveRecordingTranscript() {
 
 function showToast(message) {
   if (!toast || !toastMsg) return;
+  if (toastTimer) clearTimeout(toastTimer);
   toastMsg.textContent = message;
   toast.classList.remove('opacity-0', 'pointer-events-none');
   toast.classList.add('opacity-100');
-  setTimeout(() => {
+  toastTimer = setTimeout(() => {
     toast.classList.remove('opacity-100');
     toast.classList.add('opacity-0', 'pointer-events-none');
+    toastTimer = null;
   }, 2400);
 }
 
 // Event Listeners
-btnStartMic.addEventListener('click', () => audioManager.startRecording());
-btnStopMic.addEventListener('click', () => audioManager.stopRecording());
+btnStartMic.addEventListener('click', async () => {
+  if (!requireDataConsent()) return;
+  if (analysisPromise) cancelAnalysis();
+  await audioManager.startRecording();
+});
+btnStopMic.addEventListener('click', () => {
+  void audioManager.stopRecording();
+});
 btnClearTranscript.addEventListener('click', clearTranscript);
 btnSaveTranscript.addEventListener('click', saveRecordingTranscript);
-btnProcessAI.addEventListener('click', processTranscriptWithAI);
+btnProcessAI.addEventListener('click', () => {
+  void processTranscriptWithAI();
+});
 btnClearSummary.addEventListener('click', clearMedicalSummary);
-btnCopyToPrescription.addEventListener('click', copyToPrescription);
+btnCopyToPrescription.addEventListener('click', () => {
+  void copyToPrescription();
+});
 
-// Toggle simulation mode
-btnToggleSimulateMic.addEventListener('click', () => {
-  const isSimulated = audioManager.toggleSimulationMode();
+btnToggleSimulateMic.addEventListener('click', async () => {
+  const isSimulated = await audioManager.toggleSimulationMode();
   micModeLabel.textContent = isSimulated ? "Simulated Speech" : "Live Mic (16kHz PCM)";
   showToast(isSimulated ? "Switched to simulated voice test" : "Switched to live microphone");
 });
 
-// Quick demo loader button
 btnLoadDemo.addEventListener('click', () => {
+  if (isRecording) {
+    showToast("Stop recording before loading a sample dialogue");
+    return;
+  }
+  cancelAnalysis();
   const placeholderText = document.getElementById('placeholderText');
   if (placeholderText) placeholderText.remove();
 
@@ -497,27 +605,50 @@ btnLoadDemo.addEventListener('click', () => {
   showToast("Loaded sample consultation transcript");
 });
 
-// Patient info modal handlers
-btnEditPatient.addEventListener('click', () => {
-  patientModal.classList.remove('hidden');
+languageSelect?.addEventListener("change", () => {
+  if (isRecording) return;
+  audioManager.setLanguage(languageSelect.value);
+  transcriptLanguage = languageSelect.value;
+  detectedLanguageLabel.textContent = "Detected: —";
+  document.documentElement.lang = languageSelect.value === "auto" ? "en" : languageSelect.value;
+  showToast(languageSelect.value === "auto" ? "Automatic language detection enabled" : `Language set to ${languageSelect.value.toUpperCase()}`);
 });
 
-btnCancelPatient.addEventListener('click', () => {
+function closePatientModal() {
   patientModal.classList.add('hidden');
+}
+
+btnEditPatient.addEventListener('click', () => {
+  patientModal.classList.remove('hidden');
+  inputPatientName.focus();
+});
+btnCancelPatient.addEventListener('click', closePatientModal);
+patientModal.addEventListener('click', (event) => {
+  if (event.target === patientModal) closePatientModal();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && !patientModal.classList.contains('hidden')) {
+    closePatientModal();
+  }
 });
 
 btnSavePatient.addEventListener('click', () => {
-  const name = inputPatientName.value.trim() || "Dr Tushar";
-  const age = inputPatientAge.value.trim() || "30";
-  const gender = inputPatientGender.value || "Male";
+  const name = inputPatientName.value.trim() || "Not specified";
+  const ageValue = inputPatientAge.value.trim();
+  const ageNumber = Number(ageValue);
+  if (ageValue && (!Number.isInteger(ageNumber) || ageNumber < 0 || ageNumber > 150)) {
+    showToast("Age must be a whole number between 0 and 150");
+    return;
+  }
+  const age = ageValue || "N/A";
+  const gender = inputPatientGender.value || "Not specified";
 
   patientNameDisplay.textContent = `Patient Name: ${name}`;
-  patientMetaDisplay.innerHTML = `Age: ${age} &nbsp; Gender: ${gender}`;
-  patientModal.classList.add('hidden');
+  patientMetaDisplay.textContent = `Age: ${age}  Gender: ${gender}`;
+  closePatientModal();
   showToast("Patient information updated");
 });
 
-// Floating chat button interaction
 document.getElementById('floatingChatBtn').addEventListener('click', () => {
-  showToast("Clinical Copilot ready: ask follow-up questions or drug interactions");
+  showToast("Clinical Copilot is not connected in this local build");
 });

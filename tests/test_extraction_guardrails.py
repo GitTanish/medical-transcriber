@@ -1,14 +1,15 @@
 import asyncio
 import json
-from pathlib import Path
 import sys
+from pathlib import Path
+from unittest.mock import patch
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.append(str(ROOT_DIR))
 
-import pytest
 from backend.services.llm import analyze_clinical_transcript
+from tests.helpers import make_llm_completion
 
 # Transcript deliberately omitting medications, vitals, diagnosis, and patient demographics
 AMBIGUOUS_TRANSCRIPT = """
@@ -18,9 +19,27 @@ Doctor: "Understood. Get plenty of rest and drink water."
 """
 
 
+LLM_RESPONSE = {
+    "patient_details": {"name": None, "age": None, "sex": None, "identifiers": []},
+    "chief_complaint": "Feeling tired and unwell with a mild sore throat",
+    "history_of_present_illness": "Mild sore throat for two days.",
+    "symptoms": {"positive": ["sore throat"], "negative": ["fever", "runny nose"]},
+    "allergies": [],
+    "past_medical_history": [],
+    "medication_history": [],
+    "clinical_observations": [],
+    "assessment": [],
+    "plan": ["Rest", "Drink water"],
+    "clinical_summary": "Patient reports mild sore throat and denies fever or runny nose.",
+}
+
+
 def test_guardrails():
-    """Verify LLM guardrails prevent hallucinating patient details, medications, or diagnoses."""
-    note = asyncio.run(analyze_clinical_transcript(AMBIGUOUS_TRANSCRIPT))
+    with patch(
+        "backend.services.llm.client.chat.completions.create",
+        return_value=make_llm_completion(json.dumps(LLM_RESPONSE)),
+    ):
+        note = asyncio.run(analyze_clinical_transcript(AMBIGUOUS_TRANSCRIPT))
     data = note.model_dump()
 
     # Guardrail checks:

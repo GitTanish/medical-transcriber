@@ -1,7 +1,8 @@
 """Tests for audio preprocessing and Voice Activity Detection (VAD)."""
 
-from pathlib import Path
 import sys
+from pathlib import Path
+from unittest.mock import patch
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
@@ -11,13 +12,11 @@ import numpy as np
 import soundfile as sf
 import torch
 
+from backend.services.audio_processing import preprocess_audio
 from backend.services.vad import (
-    detect_speech,
-    extract_speech_chunks,
     extract_speech_segments,
     high_pass_filter,
 )
-from backend.services.audio_processing import preprocess_audio
 from tests.helpers import create_temp_wav_file, generate_synthetic_audio
 
 
@@ -71,6 +70,20 @@ def test_vad_speech_segmentation_structure():
     silence = torch.zeros(sample_rate * 2, dtype=torch.float32)
     segments = extract_speech_segments(silence, sample_rate=sample_rate)
     assert segments == []
+
+
+def test_vad_segment_ids_are_compact_after_filtering():
+    audio = torch.zeros(16000 * 2, dtype=torch.float32)
+    timestamps = [
+        {"start": 0, "end": 4000},
+        {"start": 5000, "end": 10000},
+        {"start": 11000, "end": 11050},
+        {"start": 12000, "end": 16000},
+    ]
+    with patch("backend.services.vad.detect_speech", return_value=timestamps):
+        segments = extract_speech_segments(audio)
+    assert [segment["id"] for segment in segments] == [0, 1, 2]
+    assert [segment["start"] for segment in segments] == [0.0, 0.31, 0.75]
 
 
 def run_standalone_demo():

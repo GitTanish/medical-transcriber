@@ -1,7 +1,7 @@
 """Tests for Whisper speech-to-text (ASR) service."""
 
-from pathlib import Path
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -13,7 +13,13 @@ import pytest
 import soundfile as sf
 import torch
 
-from backend.services.asr import audio_tensor_to_wav_bytes, transcribe_audio
+from backend.config import settings
+from backend.services.asr import (
+    audio_tensor_to_wav_bytes,
+    prompt_char_budget,
+    transcribe_audio,
+    trim_prompt_context,
+)
 from tests.helpers import create_temp_wav_file, generate_synthetic_audio
 
 
@@ -83,10 +89,46 @@ def test_transcribe_audio_graceful_error_handling():
         assert result == ""
 
 
+def test_prompt_context_capped_to_provider_limit():
+    """Verify the Whisper prompt never exceeds the provider's documented token cap."""
+    mock_response = MagicMock()
+    mock_response.text = "Patient reports chest pain"
+    long_context = " ".join(["patient reports chest pain"] * 200)
+    assert len(long_context) > settings.asr_prompt_max_chars
+
+    with patch(
+        "backend.services.asr.client.audio.transcriptions.create",
+        return_value=mock_response,
+    ) as mock_create:
+        transcribe_audio(torch.zeros(16000, dtype=torch.float32), context=long_context)
+
+    prompt = mock_create.call_args.kwargs["prompt"]
+    assert prompt
+    assert len(prompt) <= settings.asr_prompt_max_chars
+    # The most recent speech is retained, and the trim snaps to a word boundary.
+    assert long_context.endswith(prompt)
+    assert not prompt.startswith(" ")
+
+
+def test_prompt_char_budget_follows_settings(monkeypatch):
+    """Verify the prompt budget is the tighter of context window and provider cap."""
+    monkeypatch.setattr("backend.services.asr.settings.asr_context_chars", 120)
+    assert prompt_char_budget() == 120
+
+    monkeypatch.setattr("backend.services.asr.settings.asr_context_chars", 10_000)
+    assert prompt_char_budget() == settings.asr_prompt_max_chars
+
+    monkeypatch.setattr("backend.services.asr.settings.asr_prompt_max_chars", 0)
+    assert prompt_char_budget() == 0
+    assert trim_prompt_context("recent consultation context") is None
+
+
 if __name__ == "__main__":
     test_audio_tensor_to_wav_bytes_conversion()
     test_transcribe_audio_with_mocked_groq_response()
     test_transcribe_audio_from_tensor_and_bytes()
     test_transcribe_audio_invalid_input_type()
     test_transcribe_audio_graceful_error_handling()
+    test_prompt_context_capped_to_provider_limit()
+    test_prompt_char_budget_follows_settings()
     print("All ASR unit tests passed successfully!")

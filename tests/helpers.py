@@ -1,11 +1,18 @@
 """Reusable test audio generators and fixtures for testing."""
 
 import io
-from pathlib import Path
 import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+
 import numpy as np
 import soundfile as sf
-import torch
+
+
+def make_llm_completion(content: str):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+    )
 
 
 def generate_synthetic_audio(
@@ -84,8 +91,7 @@ def create_temp_wav_file(
         sample_rate=sample_rate,
         include_low_freq_rumble=include_low_freq_rumble,
     )
-    temp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    temp.write(wav_bytes)
-    temp.flush()
-    temp.close()
-    return Path(temp.name)
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp:
+        temp.write(wav_bytes)
+        temp.flush()
+        return Path(temp.name)
